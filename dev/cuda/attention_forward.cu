@@ -3,6 +3,8 @@ Kernels for attention forward pass.
 
 Compile example:
 nvcc -O3 --use_fast_math attention_forward.cu -o attention_forward -lcublas
+nvcc -O3 --use_fast_math -I/content/cutlass/include attention_forward.cu --expt-relaxed-constexpr -o attention_forward -lcublas && ./attention_forward 5
+
 
 version 1 is naive port from CPU code to kernel, parallelize over batch, time, heads only
 ./attention_forward 1
@@ -33,6 +35,7 @@ uses a directly autoregressive softmax, and uses the online softmax algorithm.
 #include <cuda_runtime.h>
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
+#include <cute/tensor.hpp>
 #include "common.h"
 
 // ----------------------------------------------------------------------------
@@ -43,48 +46,57 @@ static cublasHandle_t cublas_handle;
 // ----------------------------------------------------------------------------
 // CPU code reference
 
-void attention_forward_cpu(float* out, float* preatt, float* att,
-                       const float* inp,
-                       int B, int T, int C, int NH) {
+void attention_forward_cpu(float *out, float *preatt, float *att,
+                           const float *inp,
+                           int B, int T, int C, int NH)
+{
     // input is (B, T, 3C) Q,K,V
     // preatt, att are (B, NH, T, T)
     // output is (B, T, C)
-    int C3 = C*3;
+    int C3 = C * 3;
     int hs = C / NH; // head size
     float scale = 1.0 / sqrtf(hs);
 
-    for (int b = 0; b < B; b++) {
-        for (int t = 0; t < T; t++) {
-            for (int h = 0; h < NH; h++) {
-                const float* query_t = inp + b * T * C3 + t * C3 + h * hs;
-                float* preatt_bth = preatt + b*NH*T*T + h*T*T + t*T;
-                float* att_bth = att + b*NH*T*T + h*T*T + t*T;
+    for (int b = 0; b < B; b++)
+    {
+        for (int t = 0; t < T; t++)
+        {
+            for (int h = 0; h < NH; h++)
+            {
+                const float *query_t = inp + b * T * C3 + t * C3 + h * hs;
+                float *preatt_bth = preatt + b * NH * T * T + h * T * T + t * T;
+                float *att_bth = att + b * NH * T * T + h * T * T + t * T;
 
                 // pass 1: calculate query dot key and maxval
                 float maxval = -10000.0f; // TODO something better
-                for (int t2 = 0; t2 <= t; t2++) {
-                    const float* key_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C; // +C because it's key
+                for (int t2 = 0; t2 <= t; t2++)
+                {
+                    const float *key_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C; // +C because it's key
 
                     // (query_t) dot (key_t2)
                     float val = 0.0f;
-                    for (int i = 0; i < hs; i++) {
+                    for (int i = 0; i < hs; i++)
+                    {
                         val += query_t[i] * key_t2[i];
                     }
                     val *= scale;
-                    if (val > maxval) {
+                    if (val > maxval)
+                    {
                         maxval = val;
                     }
 
                     preatt_bth[t2] = val;
                 }
                 // pad with -INFINITY outside of autoregressive region for debugging comparisons
-                for (int t2 = t+1; t2 < T; t2++) {
+                for (int t2 = t + 1; t2 < T; t2++)
+                {
                     preatt_bth[t2] = -INFINITY;
                 }
 
                 // pass 2: calculate the exp and keep track of sum
                 float expsum = 0.0f;
-                for (int t2 = 0; t2 <= t; t2++) {
+                for (int t2 = 0; t2 <= t; t2++)
+                {
                     float expv = expf(preatt_bth[t2] - maxval);
                     expsum += expv;
                     att_bth[t2] = expv;
@@ -92,10 +104,14 @@ void attention_forward_cpu(float* out, float* preatt, float* att,
                 float expsum_inv = expsum == 0.0f ? 0.0f : 1.0f / expsum;
 
                 // pass 3: normalize to get the softmax
-                for (int t2 = 0; t2 < T; t2++) {
-                    if (t2 <= t) {
+                for (int t2 = 0; t2 < T; t2++)
+                {
+                    if (t2 <= t)
+                    {
                         att_bth[t2] *= expsum_inv;
-                    } else {
+                    }
+                    else
+                    {
                         // causal attention mask. not strictly necessary to set to zero here
                         // only doing this explicitly for debugging and checking to PyTorch
                         att_bth[t2] = 0.0f;
@@ -103,12 +119,17 @@ void attention_forward_cpu(float* out, float* preatt, float* att,
                 }
 
                 // pass 4: accumulate weighted values into the output of attention
-                float* out_bth = out + b * T * C + t * C + h * hs;
-                for (int i = 0; i < hs; i++) { out_bth[i] = 0.0f; }
-                for (int t2 = 0; t2 <= t; t2++) {
-                    const float* value_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C*2; // +C*2 because it's value
+                float *out_bth = out + b * T * C + t * C + h * hs;
+                for (int i = 0; i < hs; i++)
+                {
+                    out_bth[i] = 0.0f;
+                }
+                for (int t2 = 0; t2 <= t; t2++)
+                {
+                    const float *value_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C * 2; // +C*2 because it's value
                     float att_btht2 = att_bth[t2];
-                    for (int i = 0; i < hs; i++) {
+                    for (int i = 0; i < hs; i++)
+                    {
                         out_bth[i] += att_btht2 * value_t2[i];
                     }
                 }
@@ -120,15 +141,18 @@ void attention_forward_cpu(float* out, float* preatt, float* att,
 // ----------------------------------------------------------------------------
 // GPU kernels
 
-__global__ void attention_query_key_kernel1(float* preatt, const float* inp,
-                                           int B, int T, int C, int NH) {
+__global__ void attention_query_key_kernel1(float *preatt, const float *inp,
+                                            int B, int T, int C, int NH)
+{
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total_threads = B * NH * T * T;
 
-    if (idx < total_threads) {
+    if (idx < total_threads)
+    {
         int t2 = idx % T;
         int t = (idx / T) % T;
-        if (t2 > t) {
+        if (t2 > t)
+        {
             // autoregressive mask
             preatt[idx] = -INFINITY;
             return;
@@ -136,14 +160,15 @@ __global__ void attention_query_key_kernel1(float* preatt, const float* inp,
         int h = (idx / (T * T)) % NH;
         int b = idx / (NH * T * T);
 
-        int C3 = C*3;
+        int C3 = C * 3;
         int hs = C / NH; // head size
-        const float* query_t = inp + b * T * C3 + t * C3 + h * hs;
-        const float* key_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C; // +C because it's key
+        const float *query_t = inp + b * T * C3 + t * C3 + h * hs;
+        const float *key_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C; // +C because it's key
 
         // (query_t) dot (key_t2)
         float val = 0.0f;
-        for (int i = 0; i < hs; i++) {
+        for (int i = 0; i < hs; i++)
+        {
             val += query_t[i] * key_t2[i];
         }
         val *= 1.0 / sqrtf(hs);
@@ -155,93 +180,184 @@ __global__ void attention_query_key_kernel1(float* preatt, const float* inp,
 __global__ void attention_query_key_kernel1_shared(float *preatt, const float *inp,
                                                    int B, int T, int C, int NH, int HS, int Br, int Bc, int Tr, int Tc, float softmax_scale)
 {
-  // int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  // Within the block I need to control Batch and Head
+    // int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    // Within the block I need to control Batch and Head
 
-  int b = blockIdx.x / NH;
-  int h = blockIdx.x % NH;
+    int b = blockIdx.x / NH;
+    int h = blockIdx.x % NH;
 
-//   int Tr = T / Br; // Number of tiles along the row
-//   int Tc = T / Bc; // Number of tiles along the column
-  // total threads per block is then token_tile_size * hs
-  int C3 = C * 3;
-//   int HS = C / NH; // head size
+    //   int Tr = T / Br; // Number of tiles along the row
+    //   int Tc = T / Bc; // Number of tiles along the column
+    // total threads per block is then token_tile_size * hs
+    int C3 = C * 3;
+    //   int HS = C / NH; // head size
 
-  const float *query = inp + (b * T * C3) + (h * HS);
-  const float *key = inp + (b * T * C3) + (h * HS) + C; // +C because it's key
+    const float *query = inp + (b * T * C3) + (h * HS);
+    const float *key = inp + (b * T * C3) + (h * HS) + C; // +C because it's key
 
-  int t = threadIdx.x / Bc;  // t is the token index
-  int t2 = threadIdx.x % Bc; // t2 is the token index within the tile
-  int Htile = HS / Bc; // Number of tiles along the column
-  // int hi = threadIdx.x % HS; // hi is the index within the tile
+    int t = threadIdx.x / Bc;  // t is the token index
+    int t2 = threadIdx.x % Bc; // t2 is the token index within the tile
+    int Htile = HS / Bc;       // Number of tiles along the column
+    // int hi = threadIdx.x % HS; // hi is the index within the tile
 
-  extern __shared__ float sram[];
-  float *Q_tile = sram;
-  float *K_tile_t = &sram[Br * HS]; // K starts after Q
+    extern __shared__ float sram[];
+    float *Q_tile = sram;
+    float *K_tile_t = &sram[Br * HS]; // K starts after Q
 
-  // const float *query_t = inp + (b * T * C3) + (t * C3) + (h * hs);
-  // const float *key_t2 = inp + (b * T * C3) + (t2 * C3) + (h * hs) + C; // +C because it's key
+    // const float *query_t = inp + (b * T * C3) + (t * C3) + (h * hs);
+    // const float *key_t2 = inp + (b * T * C3) + (t2 * C3) + (h * hs) + C; // +C because it's key
 
-  for (int q_tile = 0; q_tile < Tr; ++q_tile)
-  {
-    // Load t tokens into shared memory, each thread loads one token
-    for (int hi = 0; hi < Htile; ++hi)
+    for (int q_tile = 0; q_tile < Tr; ++q_tile)
     {
-      Q_tile[t * HS + hi*Bc + t2] = query[(t + q_tile * Br) * C3 + hi*Bc + t2];
-    }
-    __syncthreads();
-    for (int k_tile = 0; k_tile < Tc; ++k_tile)
-    {
-      // Load t2 tokens into shared memory, each thread loads one token
-      for (int hi = 0; hi < Htile; ++hi)
-      {
-        K_tile_t[t * HS + hi*Bc + t2] = key[(t + k_tile * Bc) * C3 + hi*Bc + t2];
-      }
-      __syncthreads();
-      // Perform tile multiplication
-      float val = 0.0f;
-      if (t + (q_tile * Br) < t2 + (k_tile * Bc))
-      {
-        val = -INFINITY;
-      }
-      else
-      {
-        for (int hi = 0; hi < HS; ++hi)
+        // Load t tokens into shared memory, each thread loads one token
+        for (int hi = 0; hi < Htile; ++hi)
         {
-          val += Q_tile[t * HS + hi] * K_tile_t[t2 * HS + hi];
+            Q_tile[t * HS + hi * Bc + t2] = query[(t + q_tile * Br) * C3 + hi * Bc + t2];
         }
-      }
-      __syncthreads();
-      val *= softmax_scale;
-      preatt[(b * T * T * NH) + (h * T * T) + (t + q_tile * Br) * T + (t2 + k_tile * Bc)] = val;
+        __syncthreads();
+        for (int k_tile = 0; k_tile < Tc; ++k_tile)
+        {
+            // Load t2 tokens into shared memory, each thread loads one token
+            for (int hi = 0; hi < Htile; ++hi)
+            {
+                K_tile_t[t * HS + hi * Bc + t2] = key[(t + k_tile * Bc) * C3 + hi * Bc + t2];
+            }
+            __syncthreads();
+            // Perform tile multiplication
+            float val = 0.0f;
+            if (t + (q_tile * Br) < t2 + (k_tile * Bc))
+            {
+                val = -INFINITY;
+            }
+            else
+            {
+                for (int hi = 0; hi < HS; ++hi)
+                {
+                    val += Q_tile[t * HS + hi] * K_tile_t[t2 * HS + hi];
+                }
+            }
+            __syncthreads();
+            val *= softmax_scale;
+            preatt[(b * T * T * NH) + (h * T * T) + (t + q_tile * Br) * T + (t2 + k_tile * Bc)] = val;
+        }
     }
-  }
 }
 
-__global__ void attention_softmax_kernel1(float* att, const float* preatt,
-                                         int B, int T, int NH) {
+__global__ void attention_query_key_kernel1_cute(float *preatt, const float *inp,
+                                                 int B, int T, int C, int NH, int HS, int Br, int Bc, int Tr, int Tc, float softmax_scale)
+{
+    using namespace cute;
+    int block = blockIdx.x;
+    int b = blockIdx.y; // batch
+    int h = blockIdx.z; // head
+
+    int C3 = C * 3;
+
+    extern __shared__ float sram[];
+    float *smemQ = sram;
+    float *smemK = &sram[Br * HS]; // K starts after Q
+
+    // define the CuTe layout
+    Layout QK_layout = make_layout(make_shape(B, NH, T, HS), make_stride(T * C3, HS, C3, 1));
+    Layout Attn_layout = make_layout(make_shape(B, NH, T, T), make_stride(T * T * NH, T * T, T, 1));
+    Layout sQ_layout = make_layout(make_shape(Br, HS), make_stride(HS, 1));
+    Layout sK_layout = make_layout(make_shape(Bc, HS), make_stride(HS, 1));
+
+    // gmem means global memory
+    Tensor mQ = make_tensor(make_gmem_ptr(inp), QK_layout);           // (B, NH, T, HS)
+    Tensor mK = make_tensor(make_gmem_ptr(inp + C), QK_layout);       // (B, NH, T, HS)
+    Tensor mPreatt = make_tensor(make_gmem_ptr(preatt), Attn_layout); // (B, NH, T, T)
+
+    Tensor gQ_block = mQ(b, h, _, _);           // (T,HS)
+    Tensor gK_block = mK(b, h, _, _);           // (T,HS)
+    Tensor gPreatt_block = mPreatt(b, h, _, _); // (T,T)
+
+    Tensor gQ = zipped_divide(gQ_block, make_tile(Br, HS))(make_coord(_, _), block);          // this should be (Br,HS) <- This is a little of a hack, but it works
+    Tensor gK = zipped_divide(gK_block, make_tile(Bc, HS));                                   // this should be ((Bc,HS), Tile)
+    Tensor gPreatt = zipped_divide(gPreatt_block, make_tile(Br, T))(make_coord(_, _), block); // this should be (Br,T)
+
+    // smem means static memory, it gives a hint to cutlass to select algorithms that efficiently use this memory
+    Tensor sQ = make_tensor(make_smem_ptr(smemQ), sQ_layout);
+    Tensor sK = make_tensor(make_smem_ptr(smemK), sK_layout);
+
+    int t = threadIdx.x / Bc;  // <- This should go away
+    int t2 = threadIdx.x % Bc; // <- This should go away
+
+    // Define the thread layout
+    Layout tQ = make_layout(make_shape(Int<4>{}, Int<64>{}), make_stride(Int<64>{}, Int<1>{}));
+    Layout tK = make_layout(make_shape(Int<4>{}, Int<64>{}), make_stride(Int<64>{}, Int<1>{}));
+    Layout tC = make_layout(make_shape(Int<16>{}, Int<16>{}), make_stride(Int<16>{}, Int<1>{}));
+
+    // Lets assing each thread to 'tile' of items, so every thread participates in the copy
+    Tensor tQgQ = local_partition(gQ, tQ, threadIdx.x);
+    Tensor tQsQ = local_partition(sQ, tQ, threadIdx.x);
+
+    copy(tQgQ, tQsQ);
+
+    for (int k_tile = 0; k_tile < Tc; ++k_tile)
+    {
+        // In my intuition this should be outside the loop
+        Tensor tKgK = local_partition(gK(make_coord(_, _), k_tile), tK, threadIdx.x);
+        Tensor tKsK = local_partition(sK, tK, threadIdx.x);
+        Tensor ggPreatt = zipped_divide(gPreatt, make_tile(Int<16>{}, Int<16>{}))(make_coord(_, _), k_tile);
+
+        copy(tKgK, tKsK);
+
+        cp_async_fence();   // Label the end of (potential) cp.async instructions
+        cp_async_wait<0>(); // Sync on all (potential) cp.async instructions
+        __syncthreads();    // Wait for all threads to write to smem
+
+        Tensor tCggPreatt = local_partition(ggPreatt, tC, threadIdx.x);
+        Tensor tCrC = make_tensor_like(tCggPreatt); // (THR_M,THR_N)
+        // Perform tile multiplication
+        float val = 0.0f;
+        if (t + (block * Br) < t2 + (k_tile * Bc))
+        {
+            val = -INFINITY;
+        }
+        else
+        {
+            // gemm(tQsQ, tKsK, tCrC); //<- This is not working.
+            for (int hi = 0; hi < HS; ++hi)
+            {
+                val += sQ(t, hi) * sK(t2, hi);
+            }
+        }
+        __syncthreads();
+        val *= softmax_scale;
+        ggPreatt(t, t2) = val;
+    }
+}
+
+__global__ void attention_softmax_kernel1(float *att, const float *preatt,
+                                          int B, int T, int NH)
+{
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total_threads = B * T * NH;
 
-    if (idx < total_threads) {
+    if (idx < total_threads)
+    {
         int h = idx % NH;
         int t = (idx / NH) % T;
         int b = idx / (NH * T);
 
-        const float* preatt_bth = preatt + b*NH*T*T + h*T*T + t*T;
-        float* att_bth = att + b*NH*T*T + h*T*T + t*T;
+        const float *preatt_bth = preatt + b * NH * T * T + h * T * T + t * T;
+        float *att_bth = att + b * NH * T * T + h * T * T + t * T;
 
         // find maxval
         float maxval = -10000.0f; // TODO something better
-        for (int t2 = 0; t2 <= t; t2++) {
-            if (preatt_bth[t2] > maxval) {
+        for (int t2 = 0; t2 <= t; t2++)
+        {
+            if (preatt_bth[t2] > maxval)
+            {
                 maxval = preatt_bth[t2];
             }
         }
 
         // calculate the exp and keep track of sum
         float expsum = 0.0f;
-        for (int t2 = 0; t2 <= t; t2++) {
+        for (int t2 = 0; t2 <= t; t2++)
+        {
             float expv = expf(preatt_bth[t2] - maxval);
             expsum += expv;
             att_bth[t2] = expv;
@@ -249,10 +365,14 @@ __global__ void attention_softmax_kernel1(float* att, const float* preatt,
         float expsum_inv = expsum == 0.0f ? 0.0f : 1.0f / expsum;
 
         // normalize to get the softmax
-        for (int t2 = 0; t2 < T; t2++) {
-            if (t2 <= t) {
+        for (int t2 = 0; t2 < T; t2++)
+        {
+            if (t2 <= t)
+            {
                 att_bth[t2] *= expsum_inv;
-            } else {
+            }
+            else
+            {
                 // causal attention mask. not strictly necessary to set to zero here
                 // only doing this explicitly for debugging and checking to PyTorch
                 att_bth[t2] = 0.0f;
@@ -262,22 +382,27 @@ __global__ void attention_softmax_kernel1(float* att, const float* preatt,
 }
 
 // warp-level reduction for finding the maximum value
-__device__ float warpReduceMax(float val) {
-    for (int offset = 16; offset > 0; offset /= 2) {
+__device__ float warpReduceMax(float val)
+{
+    for (int offset = 16; offset > 0; offset /= 2)
+    {
         val = fmaxf(val, __shfl_down_sync(0xFFFFFFFF, val, offset));
     }
     return val;
 }
 
 // warp-level reduction for summing values
-__device__ float warpReduceSum(float val) {
-    for (int offset = 16; offset > 0; offset /= 2) {
+__device__ float warpReduceSum(float val)
+{
+    for (int offset = 16; offset > 0; offset /= 2)
+    {
         val += __shfl_down_sync(0xFFFFFFFF, val, offset);
     }
     return val;
 }
 
-__global__ void softmax_forward_kernel4(float* out, const float* inp, int N, int C) {
+__global__ void softmax_forward_kernel4(float *out, const float *inp, int N, int C)
+{
     // out is (N, C) just like inp. Each row of inp will get softmaxed.
     // same as kernel3, but can handle any block size (multiple of 32)
     // each row of C elements is handled by block_size threads
@@ -296,28 +421,32 @@ __global__ void softmax_forward_kernel4(float* out, const float* inp, int N, int
 
     // shared[] must be allocated to have 2 * warpsPerBlock elements
     // first half for max values, the second half for sum values
-    float* maxvals = shared;
-    float* sumvals = &shared[warpsPerBlock];
+    float *maxvals = shared;
+    float *sumvals = &shared[warpsPerBlock];
 
     // one row of inp, i.e. inp[idx, :] of shape (C,)
-    const float* x = inp + idx * C;
+    const float *x = inp + idx * C;
 
     // first, thread coarsening by directly accessing global memory in series
     float maxval = -INFINITY;
-    for (int i = tid; i < C; i += blockDim.x) {
+    for (int i = tid; i < C; i += blockDim.x)
+    {
         maxval = fmaxf(maxval, x[i]);
     }
     // now within-warp reductions for maxval
     maxval = warpReduceMax(maxval);
 
     // the 0th thread of each warp writes the maxval of that warp to shared memory
-    if (laneId == 0) maxvals[warpId] = maxval;
+    if (laneId == 0)
+        maxvals[warpId] = maxval;
     __syncthreads();
 
     // now the 0th thread reduces the maxvals in shared memory, i.e. across warps
-    if (tid == 0) {
+    if (tid == 0)
+    {
         float val = maxvals[tid];
-        for (int i = 1; i < warpsPerBlock; i++) {
+        for (int i = 1; i < warpsPerBlock; i++)
+        {
             val = fmaxf(val, maxvals[i]);
         }
         // store the final max in the first position
@@ -328,7 +457,8 @@ __global__ void softmax_forward_kernel4(float* out, const float* inp, int N, int
     float offset = maxvals[0];
 
     // compute expf and write the result to global memory
-    for (int i = tid; i < C; i += blockDim.x) {
+    for (int i = tid; i < C; i += blockDim.x)
+    {
         // subtract max for numerical stability
         out[idx * C + i] = expf(x[i] - offset);
     }
@@ -339,20 +469,24 @@ __global__ void softmax_forward_kernel4(float* out, const float* inp, int N, int
     // thread coarsening for sum
     x = out + idx * C;
     float sumval = 0.0f;
-    for (int i = tid; i < C; i += blockDim.x) {
+    for (int i = tid; i < C; i += blockDim.x)
+    {
         sumval += x[i];
     }
     // within-warp reduction for sumval
     sumval = warpReduceSum(sumval);
 
     // write sumval to shared memory
-    if (laneId == 0) sumvals[warpId] = sumval;
+    if (laneId == 0)
+        sumvals[warpId] = sumval;
     __syncthreads();
 
     // inter-thread reduction of sum
-    if (tid == 0) {
+    if (tid == 0)
+    {
         float val = sumvals[tid];
-        for (int i = 1; i < warpsPerBlock; ++i) {
+        for (int i = 1; i < warpsPerBlock; ++i)
+        {
             val += sumvals[i];
         }
         sumvals[0] = val;
@@ -362,61 +496,69 @@ __global__ void softmax_forward_kernel4(float* out, const float* inp, int N, int
     float sum = sumvals[0];
 
     // divide the whole row by the sum
-    for (int i = tid; i < C; i += blockDim.x) {
+    for (int i = tid; i < C; i += blockDim.x)
+    {
         out[idx * C + i] = x[i] / sum;
     }
 }
 
-
-__device__ float& vec_at(float4& vec, int index) {
-    return reinterpret_cast<float*>(&vec)[index];
+__device__ float &vec_at(float4 &vec, int index)
+{
+    return reinterpret_cast<float *>(&vec)[index];
 }
 
-__device__ float vec_at(const float4& vec, int index) {
-    return reinterpret_cast<const float*>(&vec)[index];
+__device__ float vec_at(const float4 &vec, int index)
+{
+    return reinterpret_cast<const float *>(&vec)[index];
 }
 
-__global__ void softmax_forward_kernel5(float* out, float inv_temperature, const float* inp, int N, int T) {
+__global__ void softmax_forward_kernel5(float *out, float inv_temperature, const float *inp, int N, int T)
+{
     // inp, out shape: (N, T, T), where N = B * NH
     // fuses the multiplication by scale inside attention
     // directly autoregressive, so we only compute the lower triangular part
     // uses the online softmax algorithm
-    assert(T % 4  == 0);
+    assert(T % 4 == 0);
     namespace cg = cooperative_groups;
     cg::thread_block block = cg::this_thread_block();
     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
     int idx = blockIdx.x * warp.meta_group_size() + warp.meta_group_rank();
-    if(idx >= N * T) {
+    if (idx >= N * T)
+    {
         return;
     }
     int own_pos = idx % T;
     int pos_by_4 = own_pos / 4;
 
     // one row of inp, i.e. inp[idx, :] of shape (T,)
-    const float* x = inp + idx * T;
+    const float *x = inp + idx * T;
 
     // not INF, so we don't get NaNs accidentally when subtracting two values.
     float maxval = -FLT_MAX;
     float sumval = 0.0f;
 
-    const float4* x_vec = reinterpret_cast<const float4*>(x);
-    for (int i = warp.thread_rank(); i < pos_by_4; i += warp.size()) {
+    const float4 *x_vec = reinterpret_cast<const float4 *>(x);
+    for (int i = warp.thread_rank(); i < pos_by_4; i += warp.size())
+    {
         float4 v = x_vec[i];
         float old_maxval = maxval;
-        for(int k = 0; k < 4; ++k) {
+        for (int k = 0; k < 4; ++k)
+        {
             maxval = fmaxf(maxval, vec_at(v, k));
         }
         sumval *= expf(inv_temperature * (old_maxval - maxval));
-        for(int k = 0; k < 4; ++k) {
+        for (int k = 0; k < 4; ++k)
+        {
             sumval += expf(inv_temperature * (vec_at(v, k) - maxval));
         }
     }
 
-    if(4*pos_by_4 + warp.thread_rank() <= own_pos) {
+    if (4 * pos_by_4 + warp.thread_rank() <= own_pos)
+    {
         float old_maxval = maxval;
-        maxval = fmaxf(maxval, x[4*pos_by_4 + warp.thread_rank()]);
+        maxval = fmaxf(maxval, x[4 * pos_by_4 + warp.thread_rank()]);
         sumval *= expf(inv_temperature * (old_maxval - maxval));
-        sumval += expf(inv_temperature * (x[4*pos_by_4 + warp.thread_rank()] - maxval));
+        sumval += expf(inv_temperature * (x[4 * pos_by_4 + warp.thread_rank()] - maxval));
     }
 
     float global_maxval = cg::reduce(warp, maxval, cg::greater<float>{});
@@ -426,46 +568,52 @@ __global__ void softmax_forward_kernel5(float* out, float inv_temperature, const
     float norm = 1.f / sum;
 
     // divide the whole row by the sum
-    for (int i = warp.thread_rank(); i <= own_pos; i += warp.size()) {
+    for (int i = warp.thread_rank(); i <= own_pos; i += warp.size())
+    {
         // recalculation is faster than doing the round-trip through memory.
         float ev = expf(inv_temperature * (__ldcs(x + i) - global_maxval));
         __stcs(out + idx * T + i, ev * norm);
     }
 }
 
-
-__global__ void attention_value_kernel1(float* out, const float* att, const float* inp,
-                                       int B, int T, int C, int NH) {
+__global__ void attention_value_kernel1(float *out, const float *att, const float *inp,
+                                        int B, int T, int C, int NH)
+{
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total_threads = B * T * NH;
 
-    if (idx < total_threads) {
+    if (idx < total_threads)
+    {
         int h = idx % NH;
         int t = (idx / NH) % T;
         int b = idx / (NH * T);
 
-        int C3 = C*3;
+        int C3 = C * 3;
         int hs = C / NH; // head size
 
-        float* out_bth = out + b * T * C + t * C + h * hs;
-        const float* att_bth = att + b*NH*T*T + h*T*T + t*T;
+        float *out_bth = out + b * T * C + t * C + h * hs;
+        const float *att_bth = att + b * NH * T * T + h * T * T + t * T;
 
-        for (int i = 0; i < hs; i++) { out_bth[i] = 0.0f; }
-        for (int t2 = 0; t2 <= t; t2++) {
-           const  float* value_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C*2; // +C*2 because it's value
+        for (int i = 0; i < hs; i++)
+        {
+            out_bth[i] = 0.0f;
+        }
+        for (int t2 = 0; t2 <= t; t2++)
+        {
+            const float *value_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C * 2; // +C*2 because it's value
             float att_btht2 = att_bth[t2];
-            for (int i = 0; i < hs; i++) {
+            for (int i = 0; i < hs; i++)
+            {
                 out_bth[i] += att_btht2 * value_t2[i];
             }
         }
     }
 }
 
-__global__
-void attention_forward_kernel2(
-    const float* Q,
-    const float* K,
-    const float* V,
+__global__ void attention_forward_kernel2(
+    const float *Q,
+    const float *K,
+    const float *V,
     const int N,
     const int d,
     const int Tc,
@@ -473,42 +621,48 @@ void attention_forward_kernel2(
     const int Bc,
     const int Br,
     const float softmax_scale,
-    float* l,
-    float* m,
-    float* O
-) {
+    float *l,
+    float *m,
+    float *O)
+{
     int tx = threadIdx.x;
-    int bx = blockIdx.x; int by = blockIdx.y;  // batch and head index
+    int bx = blockIdx.x;
+    int by = blockIdx.y; // batch and head index
 
     // Offset into Q,K,V,O,l,m - different for each batch and head
-    int qkv_offset = (bx * gridDim.y * N * d) + (by * N * d);  // gridDim.y = nh
-    int lm_offset = (bx * gridDim.y * N) + (by * N);  // offset for l and m
+    int qkv_offset = (bx * gridDim.y * N * d) + (by * N * d); // gridDim.y = nh
+    int lm_offset = (bx * gridDim.y * N) + (by * N);          // offset for l and m
 
     // Define SRAM for Q,K,V,S
     extern __shared__ float sram[];
-    int tile_size = Bc * d;  // size of Qi, Kj, Vj
-    float* Qi = sram;
-    float* Kj = &sram[tile_size];
-    float* Vj = &sram[tile_size * 2];
-    float* S = &sram[tile_size * 3];
+    int tile_size = Bc * d; // size of Qi, Kj, Vj
+    float *Qi = sram;
+    float *Kj = &sram[tile_size];
+    float *Vj = &sram[tile_size * 2];
+    float *S = &sram[tile_size * 3];
 
-    for (int j = 0; j < Tc; j++) {
+    for (int j = 0; j < Tc; j++)
+    {
 
         // Load Kj, Vj to SRAM
-        for (int x = 0; x < d; x++) {
+        for (int x = 0; x < d; x++)
+        {
             Kj[(tx * d) + x] = K[qkv_offset + (tile_size * j) + (tx * d) + x];
             Vj[(tx * d) + x] = V[qkv_offset + (tile_size * j) + (tx * d) + x];
         }
-        __syncthreads();  // such that the inner loop can use the correct Kj, Vj
+        __syncthreads(); // such that the inner loop can use the correct Kj, Vj
 
-        for (int i = 0; i < Tr; i++)  {
+        for (int i = 0; i < Tr; i++)
+        {
             // if past the end of the sequence, break
-            if (i * Br + tx >= N) {
+            if (i * Br + tx >= N)
+            {
                 break;
             }
 
             // Load Qi to SRAM, l and m to registers
-            for (int x = 0; x < d; x++) {
+            for (int x = 0; x < d; x++)
+            {
                 Qi[(tx * d) + x] = Q[qkv_offset + (tile_size * i) + (tx * d) + x];
             }
             float row_m_prev = m[lm_offset + (Br * i) + tx];
@@ -519,12 +673,15 @@ void attention_forward_kernel2(
             // row_m = Max_{y = 0}^{Bc-1} S[tx][y]
             // with causal masking
             float row_m = -INFINITY;
-            for (int y = 0; y < Bc; y++) {
-                if (j * Bc + y >= N) {
+            for (int y = 0; y < Bc; y++)
+            {
+                if (j * Bc + y >= N)
+                {
                     break;
                 }
                 float sum = 0;
-                for (int x = 0; x < d; x++) {
+                for (int x = 0; x < d; x++)
+                {
                     sum += Qi[(tx * d) + x] * Kj[(y * d) + x];
                 }
                 sum *= softmax_scale;
@@ -540,8 +697,10 @@ void attention_forward_kernel2(
             // P = exp(S - row_m), row_l = rowsum(P)
             // P[tx][y] = exp(S[tx][y] - row_m)
             float row_l = 0;
-            for (int y = 0; y < Bc; y++) {
-                if (j * Bc + y >= N) {
+            for (int y = 0; y < Bc; y++)
+            {
+                if (j * Bc + y >= N)
+                {
                     break;
                 }
                 if (i * Br + tx < j * Bc + y)
@@ -556,35 +715,38 @@ void attention_forward_kernel2(
             float row_l_new = (__expf(row_m_prev - row_m_new) * row_l_prev) + (__expf(row_m - row_m_new) * row_l);
 
             // Write O, l, m to HBM
-            for (int x = 0; x < d; x++) {
-                float pv = 0;  // Pij * Vj
-                for (int y = 0; y < Bc; y++) {
-                    if (j * Bc + y >= N) {
+            for (int x = 0; x < d; x++)
+            {
+                float pv = 0; // Pij * Vj
+                for (int y = 0; y < Bc; y++)
+                {
+                    if (j * Bc + y >= N)
+                    {
                         break;
                     }
                     pv += S[(Bc * tx) + y] * Vj[(y * d) + x];
                 }
-                O[qkv_offset + (tile_size * i) + (tx * d) + x] = (1 / row_l_new) \
-                    * ((row_l_prev * __expf(row_m_prev - row_m_new) * O[qkv_offset + (tile_size * i) + (tx * d) + x]) \
-                    + (__expf(row_m - row_m_new) * pv));
+                O[qkv_offset + (tile_size * i) + (tx * d) + x] = (1 / row_l_new) * ((row_l_prev * __expf(row_m_prev - row_m_new) * O[qkv_offset + (tile_size * i) + (tx * d) + x]) + (__expf(row_m - row_m_new) * pv));
             }
             m[lm_offset + (Br * i) + tx] = row_m_new;
             l[lm_offset + (Br * i) + tx] = row_l_new;
         }
-        __syncthreads();  // otherwise, thread can use the wrong Kj, Vj in inner loop
+        __syncthreads(); // otherwise, thread can use the wrong Kj, Vj in inner loop
     }
 }
 
-__global__ void permute_kernel(float* q, float* k, float* v,
-                               const float* inp,
-                               int B, int N, int NH, int d) {
+__global__ void permute_kernel(float *q, float *k, float *v,
+                               const float *inp,
+                               int B, int N, int NH, int d)
+{
     // okay so now, this kernel wants Q,K,V to all be of shape (B, NH, N, d)
     // but instead, we have a single tensor QKV (inp) of shape (B, N, 3, NH, d)
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
     // Q[b][nh_][n][d_] = inp[b][n][0][nh_][d_]
 
-    if (idx < B * NH * N * d) {
+    if (idx < B * NH * N * d)
+    {
         int b = idx / (NH * N * d);
         int rest = idx % (NH * N * d);
         int nh_ = rest / (N * d);
@@ -592,12 +754,8 @@ __global__ void permute_kernel(float* q, float* k, float* v,
         int n = rest / d;
         int d_ = rest % d;
 
-        int inp_idx = \
-            (b * N * 3 * NH * d)
-            +   (n * 3 * NH * d)
-            +       (0 * NH * d)
-            +          (nh_ * d)
-            +                d_;
+        int inp_idx =
+            (b * N * 3 * NH * d) + (n * 3 * NH * d) + (0 * NH * d) + (nh_ * d) + d_;
 
         q[idx] = inp[inp_idx];
         k[idx] = inp[inp_idx + NH * d];
@@ -605,12 +763,14 @@ __global__ void permute_kernel(float* q, float* k, float* v,
     }
 }
 
-__global__ void unpermute_kernel(const float* inp, float *out, int B, int N, int NH, int d) {
-   // out has shape (B, nh, N, d) but we need to unpermute it to (B, N, nh, d)
+__global__ void unpermute_kernel(const float *inp, float *out, int B, int N, int NH, int d)
+{
+    // out has shape (B, nh, N, d) but we need to unpermute it to (B, N, nh, d)
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
     // out[b][n][nh_][d_] <- inp[b][nh_][n][d_]
-    if (idx < B * NH * N * d) {
+    if (idx < B * NH * N * d)
+    {
         int b = idx / (NH * N * d);
         int rest = idx % (NH * N * d);
         int nh_ = rest / (N * d);
@@ -623,18 +783,23 @@ __global__ void unpermute_kernel(const float* inp, float *out, int B, int N, int
     }
 }
 
-__global__ void scale_kernel(float* inp, float scale, int B, int NH, int T) {
+__global__ void scale_kernel(float *inp, float scale, int B, int NH, int T)
+{
     // scales the pre-softmax attention scores by scale
     // and sets the autoregressive locations to -INFINITY
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < B * NH * T * T) {
+    if (idx < B * NH * T * T)
+    {
         int rest = idx % (NH * T * T);
         rest = rest % (T * T);
         int t2 = rest / T;
         int t = rest % T;
-        if (t > t2) {
+        if (t > t2)
+        {
             inp[idx] = -INFINITY;
-        } else {
+        }
+        else
+        {
             inp[idx] *= scale;
         }
     }
@@ -643,10 +808,11 @@ __global__ void scale_kernel(float* inp, float scale, int B, int NH, int T) {
 // ----------------------------------------------------------------------------
 // kernel launcher
 
-void attention_forward1(float* out, float* preatt, float* att,
-                       const float* inp,
-                       int B, int T, int C, int NH,
-                       const int block_size) {
+void attention_forward1(float *out, float *preatt, float *att,
+                        const float *inp,
+                        int B, int T, int C, int NH,
+                        const int block_size)
+{
     // attention calculation
     int total_threads = B * NH * T * T;
     int num_blocks = ceil_div(total_threads, block_size);
@@ -658,10 +824,11 @@ void attention_forward1(float* out, float* preatt, float* att,
     attention_value_kernel1<<<num_blocks, block_size>>>(out, att, inp, B, T, C, NH);
 }
 
-void attention_forward5(float* out, float* preatt, float* att,
-                       const float* inp,
-                       int B, int T, int C, int NH,
-                       const int block_size) {
+void attention_forward5(float *out, float *preatt, float *att,
+                        const float *inp,
+                        int B, int T, int C, int NH,
+                        const int block_size)
+{
     // attention calculation
     // these are hardcoded to 32 for now
     const int Bc = 16;
@@ -669,14 +836,15 @@ void attention_forward5(float* out, float* preatt, float* att,
     // renaming these to be consistent with the kernel
     const int HS = C / NH;
     // more
-    const int Tc = ceil((float) T / Bc);
-    const int Tr = ceil((float) T / Br);
+    const int Tc = ceil((float)T / Bc);
+    const int Tr = ceil((float)T / Br);
     const float softmax_scale = 1.0 / sqrt(HS);
     const int sram_size = (Bc + Br) * HS * sizeof(float);
     int total_threads = Br * Bc;
-    int num_blocks =  B * NH;
-    attention_query_key_kernel1_shared<<<num_blocks, total_threads, sram_size>>>(preatt, inp, B, T, C, NH, HS, Br, Bc, Tr, Tc, softmax_scale);
-    
+    int num_blocks = B * NH;
+    dim3 dimGrid(Tr, B, NH);
+    attention_query_key_kernel1_cute<<<dimGrid, total_threads, sram_size>>>(preatt, inp, B, T, C, NH, HS, Br, Bc, Tr, Tc, softmax_scale);
+
     // softmax and value accumulation
     total_threads = B * NH * T * T;
     num_blocks = ceil_div(total_threads, block_size);
@@ -685,10 +853,11 @@ void attention_forward5(float* out, float* preatt, float* att,
     // attention_value_kernel1<<<num_blocks, block_size>>>(out, att, inp, B, T, C, NH);
 }
 
-void attention_forward2(float* out,
-                       const float* inp,
-                       int B, int T, int C, int NH,
-                       const int block_size) {
+void attention_forward2(float *out,
+                        const float *inp,
+                        int B, int T, int C, int NH,
+                        const int block_size)
+{
     // TODO there should be no mallocs inside any of these functions!
     // not fixing this because we don't intend to use attention_forward2,
     // it seems to be way too slow as is
@@ -702,27 +871,28 @@ void attention_forward2(float* out,
     const int N = T;
     const int d = C / NH;
     // more
-    const int Tc = ceil((float) N / Bc);
-    const int Tr = ceil((float) N / Br);
+    const int Tc = ceil((float)N / Bc);
+    const int Tr = ceil((float)N / Br);
     const float softmax_scale = 1.0 / sqrt(d);
     // create some temporary memory
-    float* l;
-    float* m;
+    float *l;
+    float *m;
     cudaCheck(cudaMalloc(&l, B * nh * N * sizeof(float)));
     cudaCheck(cudaMalloc(&m, B * nh * N * sizeof(float)));
     cudaCheck(cudaMemset(l, 0, B * nh * N * sizeof(float)));
     cudaCheck(cudaMemset(m, -10000.0f, B * nh * N * sizeof(float)));
 
     // calculate SRAM size needed per block, ensure we have enough shared memory
-    int col_tile_size = Bc * d;  // size of Kj, Vj
-    int row_tile_size = Br * d;  // size of Qi
+    int col_tile_size = Bc * d; // size of Kj, Vj
+    int row_tile_size = Br * d; // size of Qi
     const int sram_size =
-        (2 * col_tile_size * sizeof(float))  // SRAM size for Kj, Vj
-        + (row_tile_size * sizeof(float))  // SRAM size for Qi
-        + (Bc * Br * sizeof(float));  // SRAM size for S
+        (2 * col_tile_size * sizeof(float)) // SRAM size for Kj, Vj
+        + (row_tile_size * sizeof(float))   // SRAM size for Qi
+        + (Bc * Br * sizeof(float));        // SRAM size for S
     int max_sram_size;
     cudaDeviceGetAttribute(&max_sram_size, cudaDevAttrMaxSharedMemoryPerBlock, 0);
-    if (sram_size > max_sram_size) {
+    if (sram_size > max_sram_size)
+    {
         printf("Max shared memory: %d, requested shared memory: %d \n", max_sram_size, sram_size);
         printf("SRAM size exceeds maximum shared memory per block\n");
         printf("Try decreasing col_tile_size or row_tile_size further\n");
@@ -730,8 +900,8 @@ void attention_forward2(float* out,
     }
 
     // grid and block dims
-    dim3 grid_dim(B, nh);  // batch_size x num_heads
-    dim3 block_dim(Br);  // Br threads per block
+    dim3 grid_dim(B, nh); // batch_size x num_heads
+    dim3 block_dim(Br);   // Br threads per block
 
     // okay so now, this kernel wants Q,K,V to all be of shape (B, nh, N, d)
     // but instead, we have a single tensor QKV (inp) of shape (B, N, 3, nh, d)
@@ -748,8 +918,7 @@ void attention_forward2(float* out,
     attention_forward_kernel2<<<grid_dim, block_dim, sram_size>>>(
         q, k, v,
         N, d, Tc, Tr, Bc, Br, softmax_scale,
-        l, m, out
-    );
+        l, m, out);
 
     // out has shape (B, nh, N, d) but we need to unpermute it to (B, N, nh, d)
     unpermute_kernel<<<num_blocks, block_size>>>(out, q, B, N, nh, d);
@@ -763,10 +932,11 @@ void attention_forward2(float* out,
     cudaCheck(cudaFree(v));
 }
 
-void attention_forward3(float* out, float* vaccum, float* qkvr, float* preatt, float* att,
-                       const float* inp,
-                       int B, int T, int C, int NH,
-                       const int block_size) {
+void attention_forward3(float *out, float *vaccum, float *qkvr, float *preatt, float *att,
+                        const float *inp,
+                        int B, int T, int C, int NH,
+                        const int block_size)
+{
     // inp is (B, T, 3C) QKV
     // preatt, att are (B, NH, T, T)
     // output is (B, T, C)
@@ -785,14 +955,14 @@ void attention_forward3(float* out, float* vaccum, float* qkvr, float* preatt, f
     const float alpha = 1.0f;
     const float beta = 0.0f;
     cublasCheck(cublasSgemmStridedBatched(cublas_handle,
-                            CUBLAS_OP_T, CUBLAS_OP_N,
-                            T, T, HS,
-                            &alpha,
-                            k, HS, T * HS,
-                            q, HS, T * HS,
-                            &beta,
-                            preatt, T, T * T,
-                            B * NH));
+                                          CUBLAS_OP_T, CUBLAS_OP_N,
+                                          T, T, HS,
+                                          &alpha,
+                                          k, HS, T * HS,
+                                          q, HS, T * HS,
+                                          &beta,
+                                          preatt, T, T * T,
+                                          B * NH));
 
     // multiply all elements of preatt elementwise by scale
     float scale = 1.0f / sqrtf(HS);
@@ -809,14 +979,14 @@ void attention_forward3(float* out, float* vaccum, float* qkvr, float* preatt, f
     // new approach: first cuBLAS another batched matmul
     // y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
     cublasCheck(cublasSgemmStridedBatched(cublas_handle,
-                            CUBLAS_OP_N, CUBLAS_OP_N,
-                            HS, T, T,
-                            &alpha,
-                            v, HS, T * HS,
-                            att, T, T * T,
-                            &beta,
-                            vaccum, HS, T * HS,
-                            B * NH));
+                                          CUBLAS_OP_N, CUBLAS_OP_N,
+                                          HS, T, T,
+                                          &alpha,
+                                          v, HS, T * HS,
+                                          att, T, T * T,
+                                          &beta,
+                                          vaccum, HS, T * HS,
+                                          B * NH));
 
     // now unpermute
     // y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
@@ -824,10 +994,11 @@ void attention_forward3(float* out, float* vaccum, float* qkvr, float* preatt, f
     unpermute_kernel<<<num_blocks, block_size>>>(vaccum, out, B, T, NH, HS);
 }
 
-void attention_forward4(float* out, float* vaccum, float* qkvr, float* preatt, float* att,
-                        const float* inp,
+void attention_forward4(float *out, float *vaccum, float *qkvr, float *preatt, float *att,
+                        const float *inp,
                         int B, int T, int C, int NH,
-                        const int block_size) {
+                        const int block_size)
+{
     // inp is (B, T, 3C) QKV
     // preatt, att are (B, NH, T, T)
     // output is (B, T, C)
@@ -846,14 +1017,14 @@ void attention_forward4(float* out, float* vaccum, float* qkvr, float* preatt, f
     const float alpha = 1.0f;
     const float beta = 0.0f;
     cublasCheck(cublasSgemmStridedBatched(cublas_handle,
-                                     CUBLAS_OP_T, CUBLAS_OP_N,
-                                     T, T, HS,
-                                     &alpha,
-                                     k, HS, T * HS,
-                                     q, HS, T * HS,
-                                     &beta,
-                                     preatt, T, T * T,
-                                     B * NH));
+                                          CUBLAS_OP_T, CUBLAS_OP_N,
+                                          T, T, HS,
+                                          &alpha,
+                                          k, HS, T * HS,
+                                          q, HS, T * HS,
+                                          &beta,
+                                          preatt, T, T * T,
+                                          B * NH));
 
     // multiply all elements of preatt elementwise by scale
     float scale = 1.0 / sqrtf(HS);
@@ -864,14 +1035,14 @@ void attention_forward4(float* out, float* vaccum, float* qkvr, float* preatt, f
     // new approach: first cuBLAS another batched matmul
     // y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
     cublasCheck(cublasSgemmStridedBatched(cublas_handle,
-                                     CUBLAS_OP_N, CUBLAS_OP_N,
-                                     HS, T, T,
-                                     &alpha,
-                                     v, HS, T * HS,
-                                     att, T, T * T,
-                                     &beta,
-                                     vaccum, HS, T * HS,
-                                     B * NH));
+                                          CUBLAS_OP_N, CUBLAS_OP_N,
+                                          HS, T, T,
+                                          &alpha,
+                                          v, HS, T * HS,
+                                          att, T, T * T,
+                                          &beta,
+                                          vaccum, HS, T * HS,
+                                          B * NH));
 
     // now unpermute
     // y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
@@ -881,34 +1052,37 @@ void attention_forward4(float* out, float* vaccum, float* qkvr, float* preatt, f
 
 // kernel version dispatch
 void attention_forward(int kernel_num,
-                       float* out, float* vaccum, float* qkvr, float* preatt, float* att,
-                       const float* inp,
+                       float *out, float *vaccum, float *qkvr, float *preatt, float *att,
+                       const float *inp,
                        int B, int T, int C, int NH,
-                       const int block_size) {
-    switch (kernel_num) {
-        case 1:
-            attention_forward1(out, preatt, att, inp, B, T, C, NH, block_size);
-            break;
-        case 2:
-            attention_forward2(out, inp, B, T, C, NH, block_size);
-            break;
-        case 3:
-            attention_forward3(out, vaccum, qkvr, preatt, att, inp, B, T, C, NH, block_size);
-            break;
-        case 4:
-            attention_forward4(out, vaccum, qkvr, preatt, att, inp, B, T, C, NH, block_size);
-            break;
-        case 5:
-            attention_forward5(out, preatt, att, inp, B, T, C, NH, block_size);
-            break;
-        default:
-            printf("Invalid kernel number\n");
-            exit(1);
+                       const int block_size)
+{
+    switch (kernel_num)
+    {
+    case 1:
+        attention_forward1(out, preatt, att, inp, B, T, C, NH, block_size);
+        break;
+    case 2:
+        attention_forward2(out, inp, B, T, C, NH, block_size);
+        break;
+    case 3:
+        attention_forward3(out, vaccum, qkvr, preatt, att, inp, B, T, C, NH, block_size);
+        break;
+    case 4:
+        attention_forward4(out, vaccum, qkvr, preatt, att, inp, B, T, C, NH, block_size);
+        break;
+    case 5:
+        attention_forward5(out, preatt, att, inp, B, T, C, NH, block_size);
+        break;
+    default:
+        printf("Invalid kernel number\n");
+        exit(1);
     }
 }
 // ----------------------------------------------------------------------------
 
-int main(int argc, char **argv) {
+int main(int argc, char **argv)
+{
     srand(0);
 
     int B = 8;
@@ -921,18 +1095,18 @@ int main(int argc, char **argv) {
     cublasCreate(&cublas_handle);
 
     // create host memory of random numbers
-    float* out = (float*)malloc(B * T * C * sizeof(float));
-    float* preatt = (float*)malloc(B * NH * T * T * sizeof(float));
-    float* att = (float*)malloc(B * NH * T * T * sizeof(float));
-    float* inp = make_random_float(B * T * 3 * C);
+    float *out = (float *)malloc(B * T * C * sizeof(float));
+    float *preatt = (float *)malloc(B * NH * T * T * sizeof(float));
+    float *att = (float *)malloc(B * NH * T * T * sizeof(float));
+    float *inp = make_random_float(B * T * 3 * C);
 
     // move to GPU
-    float* d_out;
-    float* d_vaccum;
-    float* d_qkvr;
-    float* d_preatt;
-    float* d_att;
-    float* d_inp;
+    float *d_out;
+    float *d_vaccum;
+    float *d_qkvr;
+    float *d_preatt;
+    float *d_att;
+    float *d_inp;
     cudaCheck(cudaMalloc(&d_out, B * T * C * sizeof(float)));
     cudaCheck(cudaMalloc(&d_vaccum, B * T * C * sizeof(float)));
     cudaCheck(cudaMalloc(&d_qkvr, B * T * 3 * C * sizeof(float)));
@@ -943,7 +1117,8 @@ int main(int argc, char **argv) {
 
     // read kernel_num from command line
     int kernel_num = 1;
-    if (argc > 1) {
+    if (argc > 1)
+    {
         kernel_num = atoi(argv[1]);
     }
     printf("Using kernel %d\n", kernel_num);
@@ -951,19 +1126,22 @@ int main(int argc, char **argv) {
 
     // first check the correctness of the kernel
     attention_forward_cpu(out, preatt, att, inp, B, T, C, NH);
-    for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
+    for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++)
+    {
         int block_size = block_sizes[j];
         printf("Checking block size %d.\n", block_size);
         attention_forward(kernel_num, d_out, d_vaccum, d_qkvr, d_preatt, d_att, d_inp, B, T, C, NH, block_size);
         // all kernels should produce the correct output out
         // validate_result(d_out, out, "out", B * T * C, 1e-4f);
         // but as for preatt and att, things get a bit more complicated:
-        if (kernel_num != 2) {
+        if (kernel_num != 2)
+        {
             // kernel 2 (knowingly) fails att/preatt because it uses a different algorithm
             // that estimates the softmax online and never materializes preatt/att
             // validate_result(d_att, att, "att", B * NH * T * T, 1e-4f);
         }
-        if (kernel_num != 2 && kernel_num != 4) {
+        if (kernel_num != 2 && kernel_num != 4)
+        {
             // kernel 4 (knowingly) fails preatt because it fuses the scale normalization
             // into the softmax, so preatt is off by 1.0f / sqrt(HS)
             // but att and out (checked below) should match.
@@ -973,7 +1151,8 @@ int main(int argc, char **argv) {
     printf("All results match. Starting benchmarks.\n\n");
 
     // benchmark speed of the kernel
-    for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
+    for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++)
+    {
         int block_size = block_sizes[j];
         int repeat_times = 100;
 
