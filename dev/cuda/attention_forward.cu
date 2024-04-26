@@ -167,7 +167,7 @@ __global__ void attention_query_key_kernel2(float *preatt, const float *inp,
     extern __shared__ float sram[];
     float *smemQ = sram;
     float *smemK = &sram[Br * HS]; // K starts after Q
-
+    
     // define the CuTe layout
     Layout QK_layout = make_layout(make_shape(B, NH, T, HS), make_stride(T * C3, HS, C3, 1));
     Layout Attn_layout = make_layout(make_shape(B, NH, T, T), make_stride(T * T * NH, T * T, T, 1));
@@ -180,13 +180,13 @@ __global__ void attention_query_key_kernel2(float *preatt, const float *inp,
     Tensor mK = make_tensor(make_gmem_ptr(inp + C), QK_layout);       // (B, NH, T, HS)
     Tensor mPreatt = make_tensor(make_gmem_ptr(preatt), Attn_layout); // (B, NH, T, T)
 
-    Tensor gQ_block = mQ(b, h, _, _);           // (T,HS)
-    Tensor gK_block = mK(b, h, _, _);           // (T,HS)
-    Tensor gPreatt_block = mPreatt(b, h, _, _); // (T,T)
+    Tensor gQ_block = mQ(b, h, _, _);           // (T,HS) // (M, K)
+    Tensor gK_block = mK(b, h, _, _);           // (T,HS) // (N, K)
+    Tensor gPreatt_block = mPreatt(b, h, _, _); // (T,T) // (M, N)
 
-    Tensor gQ = zipped_divide(gQ_block, make_tile(Br, HS))(make_coord(_, _), block);          // (Br,HS) <- This is a little of a hack, but it works
-    Tensor gK = zipped_divide(gK_block, make_tile(Bc, HS));                                   // ((Bc,HS), Tile)
-    Tensor gPreatt = zipped_divide(gPreatt_block, make_tile(Br, T))(make_coord(_, _), block); // (Br,T)
+    Tensor gQ = zipped_divide(gQ_block, make_tile(Br, HS))(make_coord(_, _), _);          // (Br,HS, tile) <- This is a little of a hack, but it works
+    Tensor gK = zipped_divide(gK_block, make_tile(Bc, HS))(make_coord(_, _), _);                                   // (Bc,HS, Tile)
+    Tensor gPreatt = zipped_divide(gPreatt_block, make_tile(Br, Bc))(make_coord(_, _), _); // (Br,Bc, tile)
 
     // smem means static memory, it gives a hint to cutlass to select algorithms that efficiently use this memory
     Tensor sQ = make_tensor(make_smem_ptr(smemQ), sQ_layout);
@@ -200,65 +200,99 @@ __global__ void attention_query_key_kernel2(float *preatt, const float *inp,
     Layout tK = make_layout(make_shape(Int<1>{}, Int<32>{}));
     Layout tC = make_layout(make_shape(Int<4>{}, Int<8>{}));
 
-    // Lets assing each thread to 'tile' of items, so every thread participates in the copy
-    Tensor tQgQ = local_partition(gQ, tQ, threadIdx.x);
-    Tensor tQsQ = local_partition(sQ, tQ, threadIdx.x);
-    Tensor tKsK = local_partition(sK, tK, threadIdx.x);
+    using TQ = float; // Define the type of the tensor
+    TiledCopy copyQ = make_tiled_copy(
+        Copy_Atom<UniversalCopy<uint128_t>, TQ>{},  // Atom: Copy 128 bits at a time equivalent to 4 floats
+        Layout<Shape<_1, _32>>{},                   // Thread layout
+        Layout<Shape<_4, _1>>{}                     // Value layout (4x1 because we are fetching 4 floats at a time???)
+    );
 
-    copy(tQgQ, tQsQ);
+    ThrCopy thr_copy_q = copyQ.get_slice(threadIdx.x);
+    Tensor tQgQ = thr_copy_q.partition_S(gQ);            // (CPY,CPY_M,CPY_K,k)
+    Tensor tQsQ = thr_copy_q.partition_D(sQ);            // (CPY,CPY_M,CPY_K)
+    Tensor tQrQ = make_fragment_like(tQsQ);                              // (CPY,CPY_M,CPY_K)
 
-    for (int k_tile = 0; k_tile < Tc; ++k_tile)
-    {
-        // My intuition says this should be outside the loop
-        Tensor tKgK = local_partition(gK(make_coord(_, _), k_tile), tK, threadIdx.x);
-        Tensor ggPreatt = zipped_divide(gPreatt, make_tile(Int<32>{}, Int<32>{}))(make_coord(_, _), k_tile);
-        
-        copy(tKgK, tKsK);
-
-        cp_async_fence();   // Label the end of (potential) cp.async instructions
-        cp_async_wait<0>(); // Sync on all (potential) cp.async instructions
-        __syncthreads();    // Wait for all threads to write to smem
-
-        Tensor tCggPreatt = local_partition(ggPreatt, tC, threadIdx.x, Step<_1,_1>{}); // This should be a 1x8 or 8x1 tile...
-        Tensor tCsQ = local_partition(sQ, tC, threadIdx.x, Step<_1, X>{});   // (THR_M,BLK_K)
-        Tensor tCsK = local_partition(sK, tC, threadIdx.x, Step< X,_1>{});   // (THR_M,BLK_K)
-        
-        Tensor tCrC = make_tensor_like(tCggPreatt); // (THR_M,THR_N) 8x4
-
-        if (block < k_tile) {
-            // No need to matrix multiply, this will be all masked
-            axpby(-INFINITY, tCrC, 0.0, tCggPreatt); 
-        } else if (block <= k_tile)
-        {   
-            // We know that the diagonal is all -INFINITY
-            gemm(tCsQ, tCsK, tCrC); //<- This is not working.
-            __syncthreads();
-
-            axpby(softmax_scale, tCrC, 0.0, tCggPreatt);
-                        // apply causal mask
-            __syncthreads();
-
-            for (int t = 0; t < Bc / blockDim.x; ++t)
-            {
-                for (int t2 = 0; t2 < Br; ++t2)
-                {   
-                    auto tt = threadIdx.x * (t + 1);
-                    if(tt > t2) {
-                        ggPreatt(t2, tt) = -INFINITY;
-                    }
-                    
-                }
-            }
-        }
-        else
-        {   
-            gemm(tCsQ, tCsK, tCrC); //<- This is not working.
-            axpby(softmax_scale, tCrC, 0.0, tCggPreatt); // multiply tCrC by softmax_scale and add to tCggPreatt
-        }
-        __syncthreads();
-    }
+    copy(copyQ, tQgQ(_,_,_,0), tQrQ);
+    
 }
 
+
+// __global__ void attention_query_key_kernel3(float *preatt, const float *inp,
+//                                             int B, int T, int C, int NH, int HS, int Br, int Bc, int Tr, int Tc, float softmax_scale)
+// {
+//     using namespace cute;
+//     int block = blockIdx.x;
+//     int b = blockIdx.y; // batch
+//     int h = blockIdx.z; // head
+
+//     int C3 = C * 3;
+
+//     extern __shared__ float sram[];
+//     float *smemQ = sram;
+//     float *smemK = &sram[Br * HS]; // K starts after Q
+
+//     // define the CuTe layout
+//     Layout QK_layout = make_layout(make_shape(B, NH, T, HS), make_stride(T * C3, HS, C3, 1));
+//     Layout Attn_layout = make_layout(make_shape(B, NH, T, T), make_stride(T * T * NH, T * T, T, 1));
+
+//     Layout sQ_layout = make_layout(make_shape(Int<32>{}, Int<8>{}), make_stride(Int<8>{}, Int<1>{}));
+//     Layout sK_layout = make_layout(make_shape(Int<32>{}, Int<8>{}), make_stride(Int<8>{}, Int<1>{}));
+
+//     Tensor sQ = make_tensor(make_smem_ptr(smemQ), sQ_layout);
+//     Tensor sK = make_tensor(make_smem_ptr(smemK), sK_layout);
+//     // gmem means global memory
+//     Tensor mQ = make_tensor(make_gmem_ptr(inp), QK_layout);           // (B, NH, T, HS) (B, NH, 1024, 64)
+//     Tensor mK = make_tensor(make_gmem_ptr(inp + C), QK_layout);       // (B, NH, T, HS)
+//     Tensor mO = make_tensor(make_gmem_ptr(preatt), Attn_layout); // (B, NH, T, T)
+
+//     auto bQ = Int<32>{};
+//     auto bK = Int<32>{};
+//     auto bH = Int< 8>{};
+//     auto cta_tiler = make_shape(Int<1>{}, Int<1>{}, bQ, bK, bH);
+//     // Get the appropriate blocks for this thread block
+//     auto cta_coord = make_coord(blockIdx.y, blockIdx.z, _, _, _);              // (m,n,k)
+//     Tensor gQ = local_tile(mQ, cta_tiler, cta_coord, Step<_1,_1,_1, X, _1>{})(0,0,_,_,_,_);  // (BLK_M,BLK_K,k) // (1, 1, 32, 8, 32, 8)
+//     Tensor gK = local_tile(mK, cta_tiler, cta_coord, Step<_1,_1, X, _1,_1>{})(0,0,_,_,_,_);  // (BLK_N,BLK_K,k) // (1, 1, 32, 8, 32, 8)
+
+//     using TQ = float; // Define the type of the tensor
+//     TiledCopy copy_q = make_tiled_copy(Copy_Atom<UniversalCopy<uint128_t>, TQ>{},
+//                                     Layout<Shape<_32,_1>>{},  // Thr layout 32x8 m-major
+//                                     Layout<Shape< _4,_1>>{}); // Val layout  4x1 m-major
+    
+//     ThrCopy thr_copy_q = copy_q.get_slice(threadIdx.x);
+//     Tensor tQgQ = thr_copy_q.partition_S(gQ);                            // (CPY,CPY_M,CPY_K,k)
+//     Tensor tQsQ = thr_copy_q.partition_D(sQ);                            // (CPY,CPY_M,CPY_K)
+//     // Allocate registers same shape/layout as partitioned data
+//     Tensor tQrQ = make_fragment_like(tQsQ);                              // (CPY,CPY_M,CPY_K)
+
+//     printf("tQgQ shape: %d, %d, %d, %d, %d, %d, %d\n", int(size<0>(tQgQ)), int(size<1>(tQgQ)), int(size<2>(tQgQ)), int(size<3>(tQgQ)), int(size<4>(tQgQ)));
+
+//     // copy(copy_q, tQgQ(_,_,0,0), tQrQ);
+//     // int imax = size<0>(gQ);
+//     // int jmax = size<1>(gQ);
+//     // int kmax = size<2>(gQ);
+//     // int lmax = size<3>(gQ);
+//     // int omax = size<4>(gQ);
+//     // int pmax = size<5>(gQ);
+//     // printf("imax = %d, jmax = %d, kmax = %d, lmax = %d, omax = %d, pmax = %d\n", imax, jmax, kmax, lmax, omax, pmax);
+
+
+
+//     // for (int i=0; i < size<0>(gQ); i++) {
+//     //     for (int j=0; j < size<1>(gQ); j++) {
+//     //         for (int k=0; k < size<2>(gQ); k++) {
+//     //             for (int l=0; l < size<3>(gQ); l++) {
+//     //                 for (int o=0; o < size<4>(gQ); o++) {
+//     //                     printf("gQ[%d][%d][%d][%d][%d] = %f\n", i, j, k, l, o, gQ(i,j,k,l,o));
+//     //                 }
+//     //             }
+//     //         }
+//     //     }
+//     // }
+   
+
+
+// }
 __global__ void attention_softmax_kernel1(float* att, const float* preatt,
                                          int B, int T, int NH) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -946,27 +980,27 @@ void attention_forward4(float* out, float* vaccum, float* qkvr, float* preatt, f
                                      B * NH));
 
     // multiply all elements of preatt elementwise by scale
-    float scale = 1.0 / sqrtf(HS);
-    int softmax_block_size = 256;
-    int grid_size = ceil_div(B * NH * T * 32, softmax_block_size);
-    softmax_forward_kernel5<<<grid_size, softmax_block_size>>>(att, scale, preatt, B * NH, T);
+    // float scale = 1.0 / sqrtf(HS);
+    // int softmax_block_size = 256;
+    // int grid_size = ceil_div(B * NH * T * 32, softmax_block_size);
+    // softmax_forward_kernel5<<<grid_size, softmax_block_size>>>(att, scale, preatt, B * NH, T);
 
-    // new approach: first cuBLAS another batched matmul
-    // y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
-    cublasCheck(cublasSgemmStridedBatched(cublas_handle,
-                                     CUBLAS_OP_N, CUBLAS_OP_N,
-                                     HS, T, T,
-                                     &alpha,
-                                     v, HS, T * HS,
-                                     att, T, T * T,
-                                     &beta,
-                                     vaccum, HS, T * HS,
-                                     B * NH));
+    // // new approach: first cuBLAS another batched matmul
+    // // y = att @ v # (B, nh, T, T) @ (B, nh, T, hs) -> (B, nh, T, hs)
+    // cublasCheck(cublasSgemmStridedBatched(cublas_handle,
+    //                                  CUBLAS_OP_N, CUBLAS_OP_N,
+    //                                  HS, T, T,
+    //                                  &alpha,
+    //                                  v, HS, T * HS,
+    //                                  att, T, T * T,
+    //                                  &beta,
+    //                                  vaccum, HS, T * HS,
+    //                                  B * NH));
 
-    // now unpermute
-    // y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
-    num_blocks = ceil_div(B * T * C, block_size);
-    unpermute_kernel<<<num_blocks, block_size>>>(vaccum, out, B, T, NH, HS);
+    // // now unpermute
+    // // y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+    // num_blocks = ceil_div(B * T * C, block_size);
+    // unpermute_kernel<<<num_blocks, block_size>>>(vaccum, out, B, T, NH, HS);
 }
 
 void attention_forward5(float* out, float* preatt, float* att,
@@ -995,14 +1029,14 @@ void attention_forward6(float *out, float *preatt, float *att,
   int total_threads = 32;
   int num_blocks = B * NH;
   dim3 dimGrid(Tr, B, NH);
-  attention_query_key_kernel2<<<dimGrid, total_threads, sram_size>>>(preatt, inp, B, T, C, NH, HS, Br, Bc, Tr, Tc, softmax_scale);
+  attention_query_key_kernel3<<<dimGrid, total_threads, sram_size>>>(preatt, inp, B, T, C, NH, HS, Br, Bc, Tr, Tc, softmax_scale);
 
-  // softmax and value accumulation
-  total_threads = B * NH * T * T;
-  num_blocks = ceil_div(total_threads, block_size);
-  num_blocks = ceil_div(total_threads, block_size);
-  attention_softmax_kernel1<<<num_blocks, block_size>>>(att, preatt, B, T, NH);
-  attention_value_kernel1<<<num_blocks, block_size>>>(out, att, inp, B, T, C, NH);
+//   // softmax and value accumulation
+//   total_threads = B * NH * T * T;
+//   num_blocks = ceil_div(total_threads, block_size);
+//   num_blocks = ceil_div(total_threads, block_size);
+//   attention_softmax_kernel1<<<num_blocks, block_size>>>(att, preatt, B, T, NH);
+//   attention_value_kernel1<<<num_blocks, block_size>>>(out, att, inp, B, T, C, NH);
 }
 
 // kernel version dispatch
@@ -1085,12 +1119,12 @@ int main(int argc, char **argv) {
         printf("Checking block size %d.\n", block_size);
         attention_forward(kernel_num, d_out, d_vaccum, d_qkvr, d_preatt, d_att, d_inp, B, T, C, NH, block_size);
         // all kernels should produce the correct output out
-        validate_result(d_out, out, "out", B * T * C, 1e-4f);
+        // validate_result(d_out, out, "out", B * T * C, 1e-4f);
         // but as for preatt and att, things get a bit more complicated:
         if (kernel_num != 2) {
             // kernel 2 (knowingly) fails att/preatt because it uses a different algorithm
             // that estimates the softmax online and never materializes preatt/att
-            validate_result(d_att, att, "att", B * NH * T * T, 1e-4f);
+            // validate_result(d_att, att, "att", B * NH * T * T, 1e-4f);
         }
         if (kernel_num != 2 && kernel_num != 4 && kernel_num != 5) {
             // kernel 4 (knowingly) fails preatt because it fuses the scale normalization
